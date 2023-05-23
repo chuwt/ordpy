@@ -10,6 +10,7 @@ from typing import (
 
 import requests
 from loguru import logger
+from src.db import DB
 
 HexStr = NewType('HexStr', str)
 
@@ -140,14 +141,20 @@ class Epoch:
 
 
 class Updater:
+    # height: int = 110_002
     height: int = 1
     rpc: RPC
     index: Index
+    db: DB
 
     def __init__(self, endpoint: str, index: Index = None):
         self.endpoint = endpoint
         self.rpc = RPC(self.endpoint)
         self.index = index
+        self.db = DB()
+        latest_height = self.db.get_latest_height()
+        self.height = latest_height + 1 if latest_height else 1
+        logger.info(f"Start to build index at height {self.height}")
 
     def update(self):
         pass
@@ -173,19 +180,67 @@ class Updater:
                 print(tx["vout"])
 
             time = block_data["time"]
-            logger.info(f"Block {self.height} at {time} with {len(block_data['tx'])} transactions…", )
+            logger.info(f"Block {self.height} at {time} with {len(block_data['tx'])} transactions, "
+                        f"left {current_height - self.height}")
 
             # INSCRIPTION_ID_TO_INSCRIPTION_ENTRY
 
             start_sat = Epoch.first_ordinal(self.height)
-            print(start_sat, start_sat+Epoch.subsidy(self.height))
+            end_sat = Epoch.subsidy(self.height)
+            print(start_sat, start_sat + end_sat)
 
+            # save coinbase
+            coinbase_tx = txs[0]
+            self.db.insert_sat_index(coinbase_tx["txid"], start_sat, start_sat + end_sat, 0, self.height, "")
+
+            for tx in txs[1:]:
+                input_sat_ranges = []
+                for vin in tx["vin"]:
+                    sat_ranges = self.db.get_sat_index_by_txid_id(vin["txid"], vin["vout"])
+                    input_sat_ranges += [list(i) for i in sat_ranges]
+
+                input_sat_ranges = sorted(input_sat_ranges, key=lambda k: k[1], reverse=True)
+
+                new_sat = []
+                old_sat = []
+                for index, vout in enumerate(tx["vout"]):
+                    remaining = int(vout["value"] * 10 ** 8)
+                    while remaining > 0:
+                        # txid, start, end, id
+                        sat_range = input_sat_ranges.pop()
+                        # todo check if rarity
+                        start, end = sat_range[1], sat_range[2]
+                        total_sat = end - start
+
+                        assigned = [tx["txid"], start, end, index, self.height, "address"]
+
+                        if total_sat > remaining:
+                            sat_range[1] += remaining
+                            input_sat_ranges.append(sat_range)
+                            assigned[2] = sat_range[1]
+                            self.db.insert_sat_index(
+                                sat_range[0],
+                                sat_range[1],
+                                sat_range[2],
+                                sat_range[3],
+                                sat_range[4],
+                                sat_range[5]
+                            )
+                        else:
+                            # delete sat_range
+                            old_sat.append(sat_range)
+                        new_sat.append(assigned)
+                        remaining -= assigned[2] - assigned[1]
+                for s in new_sat:
+                    self.db.insert_sat_index(s[0], s[1], s[2], s[3], s[4], s[5])
+                for s in old_sat:
+                    self.db.remove_sat_index(s[0], s[3], s[2])
 
             # batch requests
             batch_size = 10
 
             self.height += 1
-            if self.height >= 3:
+            if self.height >= 10000:
                 break
 
     def spawn_fetcher(self):
